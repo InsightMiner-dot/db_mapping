@@ -1,385 +1,206 @@
-"""
-Address Cleaner — Streamlit App
-Handles: whitespace, comma spacing, concatenated street suffixes,
-         punctuation noise, abbreviation normalization, fuzzy duplicate flagging.
-"""
-
-import re
-import io
 import streamlit as st
 import pandas as pd
-from rapidfuzz import fuzz
+import io
+import re
+from rapidfuzz import process, fuzz
 
-# ── Page config ────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Address Cleaner", layout="wide")
+# --- Processing Functions ---
 
-# ── Constants ──────────────────────────────────────────────────────────────────
-TARGET_FIELDS = ["Remit To", "Shipper", "Bill To", "Origin", "Destination", "Supplier Address"]
+def clean_whitespace(df, columns):
+    """Strips leading/trailing spaces and condenses internal multiple spaces."""
+    cleaned_df = df.copy()
+    for col in columns:
+        if cleaned_df[col].dtype == 'object' or pd.api.types.is_string_dtype(cleaned_df[col]):
+            mask = cleaned_df[col].notna()
+            cleaned_df.loc[mask, col] = (
+                cleaned_df.loc[mask, col]
+                .astype(str)
+                .str.strip()
+                .str.replace(r'\s+', ' ', regex=True)
+            )
+    return cleaned_df
 
-# Long-form suffixes only (avoid splitting short abbreviations like ST, DR mid-word)
-STREET_SUFFIXES_LONG = [
-    "STREET", "AVENUE", "BOULEVARD", "DRIVE", "ROAD", "LANE", "COURT",
-    "CIRCLE", "PLACE", "HIGHWAY", "PARKWAY", "TERRACE", "TRAIL", "SUITE", "FLOOR",
-]
-
-# Common abbreviation expansions (optional — applied only if user enables it)
-ABBREV_MAP = {
-    r"\bST\b":   "STREET",
-    r"\bAVE\b":  "AVENUE",
-    r"\bBLVD\b": "BOULEVARD",
-    r"\bDR\b":   "DRIVE",
-    r"\bRD\b":   "ROAD",
-    r"\bLN\b":   "LANE",
-    r"\bCT\b":   "COURT",
-    r"\bCIR\b":  "CIRCLE",
-    r"\bPL\b":   "PLACE",
-    r"\bHWY\b":  "HIGHWAY",
-    r"\bPKWY\b": "PARKWAY",
-    r"\bTER\b":  "TERRACE",
-    r"\bTRL\b":  "TRAIL",
-    r"\bSTE\b":  "SUITE",
-}
-
-
-# ── Core cleaning functions ────────────────────────────────────────────────────
-
-def fix_concatenated_suffix(text: str) -> str:
-    """
-    Split street suffixes that are glued to the next word.
-    e.g.  DRIVEBAYTOWN  →  DRIVE BAYTOWN
-          BLVDNORTH     →  BLVD NORTH
-    Only fires when the suffix appears at the start of a token (after space or comma).
-    """
-    for suffix in sorted(STREET_SUFFIXES_LONG, key=len, reverse=True):
-        text = re.sub(rf"(?<=[\s,])({suffix})([A-Z][a-zA-Z])", rf"\1 \2", text)
+def prep_for_matching(text):
+    """Removes noise to improve fuzzy matching accuracy."""
+    if pd.isna(text):
+        return ""
+    text = str(text).upper()
+    text = re.sub(r'[^A-Z0-9,\s]', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
     return text
 
+def normalize_column(df, columns, known_list, threshold=82):
+    """Uses RapidFuzz to snap messy data to the clean master list."""
+    normalized_df = df.copy()
+    
+    clean_known_list = [prep_for_matching(item) for item in known_list if item.strip()]
+    master_mapping = {prep_for_matching(item): item for item in known_list if item.strip()}
 
-def normalize_address(raw: str, expand_abbrev: bool = False) -> str:
-    """
-    Full normalization pipeline for a single address string.
+    for col in columns:
+        if normalized_df[col].dtype == 'object' or pd.api.types.is_string_dtype(normalized_df[col]):
+            
+            def match_logic(messy_val):
+                cleaned_messy = prep_for_matching(messy_val)
+                if not cleaned_messy:
+                    return messy_val
+                
+                match = process.extractOne(cleaned_messy, clean_known_list, scorer=fuzz.WRatio)
+                
+                if match:
+                    best_match_key, score, _ = match
+                    if score >= threshold:
+                        return master_mapping[best_match_key]
+                        
+                return messy_val 
 
-    Steps
-    -----
-    1. Uppercase + strip
-    2. Strip trailing periods from abbreviations  INC. → INC
-    3. Fix comma spacing                          GARCO,INC → GARCO, INC
-    4. Collapse internal whitespace
-    5. Split concatenated street suffixes         DRIVEBAYTOWN → DRIVE BAYTOWN
-    6. Remove redundant punctuation               double commas, trailing commas
-    7. (Optional) Expand abbreviations            DR → DRIVE
-    8. Final whitespace collapse
-    """
-    if not raw or not isinstance(raw, str):
-        return raw
+            normalized_df[col] = normalized_df[col].apply(match_logic)
+            
+    return normalized_df
 
-    s = raw.upper().strip()
+def generate_change_log(original_df, processed_df, columns):
+    """Compares original and processed dataframes to log row-by-row changes."""
+    log_records = []
+    
+    for col in columns:
+        for idx in original_df.index:
+            orig_val = original_df.at[idx, col]
+            new_val = processed_df.at[idx, col]
+            
+            # Safely handle NaN comparisons
+            if pd.isna(orig_val) and pd.isna(new_val):
+                continue
+                
+            # If the value changed, log it
+            if str(orig_val) != str(new_val):
+                log_records.append({
+                    'Excel Row': idx + 2, # +2 to match Excel row numbering (1-based + header)
+                    'Column': col,
+                    'Original Value': orig_val,
+                    'Cleaned Value': new_val
+                })
+                
+    return pd.DataFrame(log_records)
 
-    # Step 2 — remove trailing period from abbreviations (INC. CO. LTD.)
-    s = re.sub(r"\b([A-Z]{1,6})\.", r"\1", s)
+# --- Streamlit UI ---
 
-    # Step 3 — normalize comma spacing
-    s = re.sub(r",\s*", ", ", s)
-
-    # Step 4 — collapse whitespace
-    s = re.sub(r"\s+", " ", s)
-
-    # Step 5 — split glued suffixes (pad with space so lookahead works at start)
-    s = " " + s
-    s = fix_concatenated_suffix(s)
-    s = s.strip()
-
-    # Step 6 — clean up punctuation artifacts
-    s = re.sub(r",\s*,", ",", s)   # double comma
-    s = re.sub(r"\s+,", ",", s)    # space before comma
-    s = s.strip(" ,")
-
-    # Step 7 — optional abbreviation expansion
-    if expand_abbrev:
-        for pattern, replacement in ABBREV_MAP.items():
-            s = re.sub(pattern, replacement, s)
-
-    # Step 8 — final whitespace pass
-    s = re.sub(r"\s+", " ", s).strip()
-
-    return s
-
-
-def clean_whitespace_only(value: str) -> str:
-    """Basic whitespace clean (strip + collapse) for non-address columns."""
-    if not isinstance(value, str):
-        return value
-    return re.sub(r"\s+", " ", value.strip())
-
-
-def process_dataframe(
-    df: pd.DataFrame,
-    address_cols: list,
-    whitespace_cols: list,
-    expand_abbrev: bool,
-) -> pd.DataFrame:
-    """Apply appropriate cleaning to each selected column."""
-    cleaned = df.copy()
-
-    for col in address_cols:
-        mask = cleaned[col].notna()
-        cleaned.loc[mask, col] = cleaned.loc[mask, col].astype(str).apply(
-            lambda v: normalize_address(v, expand_abbrev)
+def main():
+    st.set_page_config(page_title="Data Cleaner Pipeline", layout="wide")
+    st.title("Excel Data Cleaner & Normalizer")
+    
+    # Sidebar for Master List Configuration
+    with st.sidebar:
+        st.header("Normalization Settings")
+        st.markdown("Paste your master list of clean addresses here (one per line).")
+        
+        default_master = (
+            "ExxonMobil Chemical, BAYWAY DRIVE, BAYTOWN, TX 77520\n"
+            "GARCO, INC., ASHEBORO, NC 27203\n"
+            "Dow Chemical Company, 123 MAIN ST, HOUSTON, TX 77002"
         )
+        
+        master_list_input = st.text_area("Master Records", value=default_master, height=300)
+        match_threshold = st.slider("Match Confidence Threshold", 50, 100, 82)
 
-    for col in whitespace_cols:
-        if col not in address_cols:
-            mask = cleaned[col].notna()
-            cleaned.loc[mask, col] = cleaned.loc[mask, col].astype(str).apply(
-                clean_whitespace_only
+    # 1. Main Upload UI
+    uploaded_file = st.file_uploader("Upload Excel File", type=["xlsx", "xls"])
+
+    if uploaded_file is not None:
+        try:
+            # 2. Select Sheet
+            xls = pd.ExcelFile(uploaded_file)
+            selected_sheet = st.selectbox("Select Sheet", options=xls.sheet_names)
+            
+            # Keep a pristine copy of the original data for the change log
+            original_df = pd.read_excel(uploaded_file, sheet_name=selected_sheet)
+            
+            st.subheader("Data Preview")
+            st.dataframe(original_df.head(), use_container_width=True)
+
+            # 3. Column Selection
+            st.markdown("### 1. Select Columns to Clean")
+            target_fields = ["Remit To", "Shipper", "Bill To", "Origin", "Destination", "Supplier Address"]
+            default_cols = [col for col in target_fields if col in original_df.columns]
+            
+            selected_columns = st.multiselect(
+                "Columns to target:",
+                options=original_df.columns.tolist(),
+                default=default_cols
             )
 
-    return cleaned
+            # 4. Cleaning Checkboxes
+            st.markdown("### 2. Select Cleaning Actions")
+            col1, col2 = st.columns(2)
+            with col1:
+                do_whitespace = st.checkbox("🧹 Strip Extra Whitespaces", value=True)
+            with col2:
+                do_normalize = st.checkbox("🔗 Apply Fuzzy Normalization", value=False)
 
+            # 5. Process Execution
+            if st.button("Process Data", type="primary"):
+                if not selected_columns:
+                    st.warning("Please select at least one column.")
+                    return
+                if not do_whitespace and not do_normalize:
+                    st.warning("Please select at least one cleaning action.")
+                    return
 
-def count_changes(orig: pd.DataFrame, cleaned: pd.DataFrame, cols: list) -> dict:
-    stats = {}
-    for col in cols:
-        if col in orig.columns:
-            diff = (orig[col].fillna("").astype(str) != cleaned[col].fillna("").astype(str))
-            stats[col] = int(diff.sum())
-    stats["_total"] = sum(v for k, v in stats.items() if not k.startswith("_"))
-    return stats
+                with st.spinner("Processing data..."):
+                    # Create a working copy to apply changes to
+                    processed_df = original_df.copy()
+                    
+                    # Apply actions
+                    if do_whitespace:
+                        processed_df = clean_whitespace(processed_df, selected_columns)
+                        
+                    if do_normalize:
+                        master_list = master_list_input.split('\n')
+                        processed_df = normalize_column(processed_df, selected_columns, master_list, threshold=match_threshold)
+                        
+                    # Generate the Change Log
+                    change_log_df = generate_change_log(original_df, processed_df, selected_columns)
 
+                st.success("Data processed successfully!")
+                
+                # Show results
+                st.markdown("### Cleaned Data Preview")
+                st.dataframe(processed_df.head(), use_container_width=True)
 
-def find_fuzzy_duplicates(df: pd.DataFrame, col: str, threshold: int = 85) -> pd.DataFrame:
-    """
-    Identify rows in `col` whose cleaned values are near-duplicates (similar but not identical).
-    Returns a DataFrame of pairs with their similarity score.
-    """
-    vals = df[col].dropna().astype(str).unique().tolist()
-    pairs = []
-    for i in range(len(vals)):
-        for j in range(i + 1, len(vals)):
-            score = fuzz.token_sort_ratio(vals[i], vals[j])
-            if threshold <= score < 100:
-                pairs.append({"Value A": vals[i], "Value B": vals[j], "Similarity %": round(score, 1)})
-    return pd.DataFrame(pairs).sort_values("Similarity %", ascending=False) if pairs else pd.DataFrame()
+                if not change_log_df.empty:
+                    st.markdown(f"### Change Log ({len(change_log_df)} edits made)")
+                    st.dataframe(change_log_df.head(10), use_container_width=True)
+                else:
+                    st.info("No changes were needed. The data is already clean based on your settings.")
 
+                # 6. Prepare Downloads
+                st.markdown("### 3. Download Files")
+                dl_col1, dl_col2 = st.columns(2)
+                
+                # Excel Download Buffer
+                excel_output = io.BytesIO()
+                with pd.ExcelWriter(excel_output, engine='xlsxwriter') as writer:
+                    processed_df.to_excel(writer, index=False, sheet_name=selected_sheet[:31])
+                
+                with dl_col1:
+                    st.download_button(
+                        label="⬇️ Download Cleaned Excel",
+                        data=excel_output.getvalue(),
+                        file_name="cleaned_data.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
 
-def build_diff_records(orig: pd.DataFrame, cleaned: pd.DataFrame, cols: list, max_rows: int = 200) -> pd.DataFrame:
-    """Build a flat DataFrame of changed cells for display."""
-    records = []
-    for col in cols:
-        o_series = orig[col].fillna("").astype(str)
-        c_series = cleaned[col].fillna("").astype(str)
-        changed_idx = o_series[o_series != c_series].index
-        for idx in changed_idx[:max_rows]:
-            records.append({
-                "Row": idx + 2,           # Excel row (1-indexed + header)
-                "Column": col,
-                "Before": orig.at[idx, col],
-                "After":  cleaned.at[idx, col],
-            })
-    return pd.DataFrame(records)
+                # Log Download Buffer (as CSV for ease)
+                if not change_log_df.empty:
+                    csv_log = change_log_df.to_csv(index=False).encode('utf-8')
+                    with dl_col2:
+                        st.download_button(
+                            label="⬇️ Download Change Log (CSV)",
+                            data=csv_log,
+                            file_name="cleaning_log.csv",
+                            mime="text/csv"
+                        )
+                
+        except Exception as e:
+            st.error(f"An error occurred: {e}")
 
-
-# ── UI ─────────────────────────────────────────────────────────────────────────
-
-st.title("🧹 Address & Whitespace Cleaner")
-st.caption("Normalize addresses, fix punctuation noise, collapse whitespace, and flag near-duplicates.")
-
-st.divider()
-
-# ── Step 1: Upload ─────────────────────────────────────────────────────────────
-st.subheader("1 · Upload Excel File")
-uploaded_file = st.file_uploader("Upload .xlsx or .xls", type=["xlsx", "xls"])
-
-if not uploaded_file:
-    st.info("Upload an Excel file to begin.")
-    st.stop()
-
-# ── Step 2: Sheet ──────────────────────────────────────────────────────────────
-st.subheader("2 · Select Sheet")
-try:
-    xls = pd.ExcelFile(uploaded_file)
-except Exception as e:
-    st.error(f"Cannot read file: {e}")
-    st.stop()
-
-selected_sheet = st.selectbox("Sheet", xls.sheet_names)
-
-try:
-    df = pd.read_excel(uploaded_file, sheet_name=selected_sheet, dtype=str)
-except Exception as e:
-    st.error(f"Cannot load sheet: {e}")
-    st.stop()
-
-st.caption(f"Loaded **{df.shape[0]:,} rows × {df.shape[1]} columns** from `{selected_sheet}`")
-
-with st.expander("Preview raw data (first 5 rows)"):
-    st.dataframe(df.head(5), use_container_width=True)
-
-st.divider()
-
-# ── Step 3: Select columns ─────────────────────────────────────────────────────
-st.subheader("3 · Select Columns")
-
-str_cols  = [c for c in df.columns if df[c].dtype == object or pd.api.types.is_string_dtype(df[c])]
-auto_cols = [c for c in TARGET_FIELDS if c in str_cols]
-
-selected_cols = st.multiselect(
-    "Choose columns to clean",
-    options=str_cols,
-    default=auto_cols,
-    help="Only text columns are listed. Known address fields are pre-selected.",
-)
-
-if not selected_cols:
-    st.warning("Select at least one column to continue.")
-    st.stop()
-
-st.divider()
-
-# ── Step 4: Cleaning mode ──────────────────────────────────────────────────────
-st.subheader("4 · Cleaning Mode")
-st.caption("Choose what to apply to the selected columns.")
-
-col_ck1, col_ck2 = st.columns(2)
-
-with col_ck1:
-    do_whitespace = st.checkbox(
-        "✂️  Whitespace cleaning",
-        value=True,
-        help="Strips leading/trailing spaces and collapses multiple spaces into one.",
-    )
-    do_normalize = st.checkbox(
-        "🔧  Address normalization",
-        value=True,
-        help=(
-            "Full address fix: comma spacing, concatenated suffixes "
-            "(DRIVEBAYTOWN → DRIVE BAYTOWN), punctuation cleanup, uppercase."
-        ),
-    )
-
-with col_ck2:
-    # Sub-option — only shown when normalization is on
-    if do_normalize:
-        expand_abbrev = st.checkbox(
-            "📖  Expand abbreviations (DR → DRIVE, AVE → AVENUE)",
-            value=False,
-            help="Expands common street abbreviations. Applied after normalization.",
-        )
-    else:
-        expand_abbrev = False
-
-    run_fuzzy = st.checkbox(
-        "🔍  Flag near-duplicate addresses",
-        value=False,
-        help="Detects values that look like the same address written differently (≥85% similarity).",
-    )
-    if run_fuzzy:
-        fuzzy_threshold = st.slider("Similarity threshold (%)", 70, 99, 85)
-    else:
-        fuzzy_threshold = 85
-
-if not do_whitespace and not do_normalize:
-    st.warning("Enable at least one cleaning mode to continue.")
-    st.stop()
-
-# Show a plain-English summary of what will run
-mode_parts = []
-if do_whitespace and not do_normalize:
-    mode_parts.append("**Whitespace only** — strip & collapse spaces")
-if do_normalize and not do_whitespace:
-    mode_parts.append("**Normalization only** — address fixes (whitespace included as part of normalization)")
-if do_whitespace and do_normalize:
-    mode_parts.append("**Whitespace + Normalization** — full pipeline")
-if expand_abbrev:
-    mode_parts.append("+ abbreviation expansion")
-if run_fuzzy:
-    mode_parts.append(f"+ near-duplicate scan at {fuzzy_threshold}%")
-
-st.info("  ·  ".join(mode_parts))
-
-st.divider()
-
-# ── Step 5: Run ────────────────────────────────────────────────────────────────
-st.subheader("5 · Run")
-
-if st.button("▶  Run Cleaning", type="primary"):
-
-    # Decide which columns go into which pipeline
-    # If only whitespace: all selected → whitespace pipeline
-    # If only normalize: all selected → address pipeline
-    # If both: all selected → address pipeline (which includes whitespace steps)
-    if do_normalize:
-        addr_cols_run = selected_cols
-        ws_cols_run   = []          # normalization already collapses whitespace
-    else:
-        addr_cols_run = []
-        ws_cols_run   = selected_cols
-
-    with st.spinner("Processing…"):
-        cleaned_df = process_dataframe(df, addr_cols_run, ws_cols_run, expand_abbrev)
-        all_cols_run = list(set(addr_cols_run + ws_cols_run))
-        stats      = count_changes(df, cleaned_df, all_cols_run)
-        diff_df    = build_diff_records(df, cleaned_df, all_cols_run)
-
-    total_changed = stats["_total"]
-    cols_touched  = sum(1 for k, v in stats.items() if not k.startswith("_") and v > 0)
-
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Rows",              f"{df.shape[0]:,}")
-    m2.metric("Columns processed", len(all_cols_run))
-    m3.metric("Cells modified",    total_changed)
-    m4.metric("Columns changed",   cols_touched)
-
-    st.divider()
-
-    # Per-column breakdown
-    with st.expander("Per-column change counts", expanded=True):
-        bd = pd.DataFrame([
-            {
-                "Column": k,
-                "Cells changed": v,
-                "Mode": "Normalize" if k in addr_cols_run else "Whitespace",
-            }
-            for k, v in stats.items() if not k.startswith("_")
-        ]).sort_values("Cells changed", ascending=False)
-        st.dataframe(bd, use_container_width=True, hide_index=True)
-
-    # Cell diff
-    if not diff_df.empty:
-        with st.expander(f"Cell-level diff — {len(diff_df)} changes (showing up to 200)", expanded=True):
-            st.dataframe(diff_df, use_container_width=True, hide_index=True)
-    else:
-        st.success("No changes detected — data was already clean.")
-
-    # Fuzzy duplicates
-    if run_fuzzy and addr_cols_run:
-        st.divider()
-        st.subheader("Near-duplicate Detection")
-        for col in addr_cols_run:
-            with st.spinner(f"Scanning '{col}'…"):
-                dup_df = find_fuzzy_duplicates(cleaned_df, col, threshold=fuzzy_threshold)
-            if dup_df.empty:
-                st.success(f"**{col}**: No near-duplicates above {fuzzy_threshold}%.")
-            else:
-                st.warning(f"**{col}**: {len(dup_df)} near-duplicate pair(s) found.")
-                st.dataframe(dup_df, use_container_width=True, hide_index=True)
-
-    st.divider()
-
-    # Download
-    st.subheader("Download")
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        cleaned_df.to_excel(writer, index=False, sheet_name=selected_sheet[:31])
-        if not diff_df.empty:
-            diff_df.to_excel(writer, index=False, sheet_name="Changes Log")
-    output.seek(0)
-
-    original_name = uploaded_file.name.rsplit(".", 1)[0]
-    st.download_button(
-        label="⬇️  Download Cleaned Excel (+ Changes Log sheet)",
-        data=output.getvalue(),
-        file_name=f"{original_name}_cleaned.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-    st.caption("The downloaded file includes a **Changes Log** sheet with every before/after cell.")
+if __name__ == "__main__":
+    main()
