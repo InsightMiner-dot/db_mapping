@@ -19,8 +19,8 @@ load_dotenv()
 class VarianceState(TypedDict):
     row_data: dict         
     history: str           
-    recent_historical_comment: str  # NEW: Stores the exact previous comment
-    recent_historical_reason: str   # NEW: Stores the exact previous reason
+    recent_historical_comment: str  
+    recent_historical_reason: str   
     draft_comment: str     
     draft_reason: str      
     final_comment: str     
@@ -35,7 +35,7 @@ def retrieve_history_node(state: VarianceState) -> dict:
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
-    # EXACT columns requested for the perfect historical match
+    # FIXED: Updated to "Department_desc" exactly as requested
     standard_columns = [
         "Scenario-A",
         "Scenario-B",
@@ -44,7 +44,7 @@ def retrieve_history_node(state: VarianceState) -> dict:
         "OH_LC", 
         "Division_Desc", 
         "Function_desc",      
-        "Department_descc",   
+        "Department_desc",    # <-- Fixed spelling here 
         "Entity_desc",        
         "CostCat description"
     ]
@@ -55,7 +55,9 @@ def retrieve_history_node(state: VarianceState) -> dict:
     for col in standard_columns:
         if col in state["row_data"]:
             match_keys.append(col)
-            values.append(state["row_data"][col])
+            # .strip() removes hidden trailing spaces that break SQL matches
+            val = str(state["row_data"][col]).strip() 
+            values.append(val)
             
     try:
         cursor.execute("SELECT count(name) FROM sqlite_master WHERE type='table' AND name='historical_variances'")
@@ -82,7 +84,15 @@ def retrieve_history_node(state: VarianceState) -> dict:
             WHERE {where_clauses} 
             ORDER BY Year DESC, Month DESC LIMIT 6
         """
-        
+
+        # --- SQL DEBUGGER (Will print to terminal so you can see exact matches) ---
+        print("\n" + "="*40)
+        print("🔍 SQL DEBUGGER:")
+        print(f"QUERY: \n{query.strip()}")
+        print(f"\nVALUES SEARCHED: \n{tuple(values)}")
+        print("="*40 + "\n")
+        # --------------------------------------------------------------------------
+
         cursor.execute(query, tuple(values))
         results = cursor.fetchall()
         conn.close()
@@ -150,9 +160,10 @@ def generate_draft_node(state: VarianceState) -> dict:
     
     chain = prompt | llm
     
+    # FIXED: Updated to look for "Department_desc"
     details = {
         "Region": state["row_data"].get("Region", "Not Provided"),
-        "Department": state["row_data"].get("Department_descc", "Not Provided"),
+        "Department": state["row_data"].get("Department_desc", "Not Provided"),
         "Cost Category": state["row_data"].get("CostCat description", "Not Provided")
     }
     
@@ -268,7 +279,8 @@ def process_variances(input_excel, output_excel):
         row_data = row.fillna("").to_dict()
         
         region = row_data.get('Region', 'Unknown Region')
-        dept = row_data.get('Department_descc', 'Unknown Dept')
+        # FIXED: Updated to look for "Department_desc"
+        dept = row_data.get('Department_desc', 'Unknown Dept')
         cost_cat = row_data.get('CostCat description', 'Unknown Category')
         variance_amt = row_data.get('Variancce Amount ', 0) 
         
