@@ -10,31 +10,33 @@ from langchain_core.prompts import PromptTemplate
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 
-# Load environment variables
+# Load environment variables securely
 load_dotenv()
 
 # ==========================================
 # 1. DEFINE THE GRAPH STATE
 # ==========================================
 class VarianceState(TypedDict):
-    row_data: dict         
-    history: str           
-    draft_comment: str     
-    draft_reason: str      
-    final_comment: str     
-    final_reason: str      
+    row_data: dict         # All columns from the current Excel row
+    history: str           # Retrieved historical context
+    draft_comment: str     # AI generated Comment
+    draft_reason: str      # AI generated Reason_for_variance
+    final_comment: str     # Human approved Comment
+    final_reason: str      # Human approved Reason
 
 # ==========================================
 # 2. DEFINE THE GRAPH NODES
 # ==========================================
 def retrieve_history_node(state: VarianceState) -> dict:
-    """Strictly queries SQLite using the EXACT spelling from the user's database."""
+    """Queries SQLite using all structural columns and Scenarios to build a trend history."""
     db_path = "master_historical_db.db"
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
-    # EXACT spellings from your uploaded file
+    # EXACT columns requested for the perfect historical match
     standard_columns = [
+        "Scenario-A",
+        "Scenario-B",
         "Region", 
         "Market", 
         "OH_LC", 
@@ -48,27 +50,32 @@ def retrieve_history_node(state: VarianceState) -> dict:
     match_keys = []
     values = []
     
+    # Extract only these standard columns from the current row
     for col in standard_columns:
         if col in state["row_data"]:
             match_keys.append(col)
             values.append(state["row_data"][col])
             
     try:
+        # Check if table exists
         cursor.execute("SELECT count(name) FROM sqlite_master WHERE type='table' AND name='historical_variances'")
         if cursor.fetchone()[0] == 0:
             conn.close()
             return {"history": "Master database initialized, but no historical data exists yet."}
 
+        # Abort if the file is missing the structural columns
         if not match_keys:
              return {"history": "No standard structural dimensions found in this row."}
 
+        # Safely wrap column names in double quotes to handle spaces/hyphens
         where_clauses = " AND ".join([f'"{col}" = ?' for col in match_keys])
         
+        # Pull up to the last 6 months of data to establish a solid trend
         query = f"""
             SELECT Year, Month, "Variancce Amount ", Comments, Reason_for_variance 
             FROM historical_variances 
             WHERE {where_clauses} 
-            ORDER BY Year DESC, Month DESC LIMIT 3
+            ORDER BY Year DESC, Month DESC LIMIT 6
         """
         
         cursor.execute(query, tuple(values))
@@ -76,12 +83,15 @@ def retrieve_history_node(state: VarianceState) -> dict:
         conn.close()
         
         if not results:
-            return {"history": "No historical data found for this exact structural line item."}
+            return {"history": "No historical data found for this exact scenario and line item."}
             
-        history_lines = [
-            f"- In {row[1]} {row[0]}, the variance was {row[2]}. Prior Comment: '{row[3]}'. Prior Reason: '{row[4]}'."
-            for row in results
-        ]
+        # Format the history so the AI can easily read the trend
+        history_lines = ["--- HISTORICAL TREND ---"]
+        for row in results:
+            history_lines.append(
+                f"- {row[1]} {row[0]}: Variance = {row[2]} | Comment: '{row[3]}' | Reason: '{row[4]}'"
+            )
+        
         return {"history": "\n".join(history_lines)}
         
     except sqlite3.OperationalError as e:
@@ -89,7 +99,7 @@ def retrieve_history_node(state: VarianceState) -> dict:
         return {"history": f"Database lookup failed: {e}"}
 
 def generate_draft_node(state: VarianceState) -> dict:
-    """Passes the data to Azure OpenAI to compare current vs. previous variance."""
+    """Passes the data to Azure OpenAI to analyze the trend and generate drafts."""
     llm = AzureChatOpenAI(
         azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
         api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
@@ -109,8 +119,8 @@ def generate_draft_node(state: VarianceState) -> dict:
         {history}
         
         TASK:
-        1. Compare the current variance to the history.
-        2. Generate a "Comments" field. If there is history, explicitly mention the previous month/year (e.g., "Similar to November 2025, this variance is driven by...").
+        1. Compare the current variance to the historical trend.
+        2. Generate a "Comments" field (1 sentence). If there is history, explicitly mention the previous month/year trend (e.g., "Continuing the trend from November 2025, this variance is driven by...").
         3. Generate a "Reason_for_variance" field explaining the likely business driver based on the historical context.
         
         Respond ONLY with a valid JSON object using exactly these keys: 
@@ -146,6 +156,7 @@ def generate_draft_node(state: VarianceState) -> dict:
         }
 
 def human_approval_node(state: VarianceState) -> dict:
+    """Dummy node to interrupt the graph for human input."""
     return {}
 
 def save_memory_node(state: VarianceState) -> dict:
@@ -163,7 +174,7 @@ def save_memory_node(state: VarianceState) -> dict:
     insert_data["Comments"] = state["final_comment"]
     insert_data["Reason_for_variance"] = state["final_reason"]
     
-    # Remove the 'New_AI_' columns from the database insert so we don't corrupt the SQL schema
+    # Prevent the new Excel-only columns from polluting the SQL database
     insert_data.pop("New_AI_Comments", None)
     insert_data.pop("New_AI_Reason", None)
     
@@ -249,13 +260,15 @@ def process_variances(input_excel, output_excel):
         
         config = {"configurable": {"thread_id": f"batch_run_row_{index}"}}
 
+        # 1. Run until human approval
         for event in app.stream(initial_state, config):
             pass 
         
         current_state = app.get_state(config).values
         
-        print(f"\n--- HISTORICAL CONTEXT ---\n{current_state.get('history', 'None').strip()}")
+        print(f"\n{current_state.get('history', 'None').strip()}")
         
+        # 2. Human Review Process
         print("\n--- AI DRAFTS ---")
         print(f"Comment : {current_state.get('draft_comment')}")
         print(f"Reason  : {current_state.get('draft_reason')}")
@@ -268,14 +281,16 @@ def process_variances(input_excel, output_excel):
         user_reason = input("Edit Reason  > ")
         final_reason = current_state['draft_reason'] if user_reason.strip() == "" else user_reason.strip()
         
+        # 3. Update state, resume graph, and save to DB
         app.update_state(config, {"final_comment": final_comment, "final_reason": final_reason})
         for event in app.stream(None, config):
             pass
             
-        # WRITE THE APPROVED OUTPUT TO THE BRAND NEW COLUMNS
+        # 4. WRITE THE APPROVED OUTPUT TO THE BRAND NEW COLUMNS
         df.at[index, 'New_AI_Comments'] = final_comment
         df.at[index, 'New_AI_Reason'] = final_reason
 
+    # Final Export
     print("\n" + "="*60)
     print(f"Review complete. Exporting final data to {output_excel}...")
     try:
@@ -288,6 +303,7 @@ def process_variances(input_excel, output_excel):
 # 5. EXECUTION
 # ==========================================
 if __name__ == "__main__":
+    # Ensure your one-time CSV database is loaded before running!
     my_input_file = "current_month_variances.xlsx"
     my_output_file = "final_reviewed_variances.xlsx"
     
