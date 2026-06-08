@@ -14,7 +14,24 @@ from langgraph.checkpoint.memory import MemorySaver
 load_dotenv()
 
 # ==========================================
-# 1. DEFINE THE GRAPH STATE
+# 1. HELPER LOGIC FOR DATES
+# ==========================================
+def get_yyyymm(year, month_str):
+    """Converts a Year and Month string into a sortable integer (e.g., 2025 'December' -> 202512)."""
+    months = {
+        'january': 1, 'jan': 1, 'february': 2, 'feb': 2, 'march': 3, 'mar': 3,
+        'april': 4, 'apr': 4, 'may': 5, 'june': 6, 'jun': 6,
+        'july': 7, 'jul': 7, 'august': 8, 'aug': 8, 'september': 9, 'sep': 9,
+        'october': 10, 'oct': 10, 'november': 11, 'nov': 11, 'december': 12, 'dec': 12
+    }
+    try:
+        m = months[str(month_str).strip().lower()]
+        return int(year) * 100 + m
+    except (KeyError, ValueError):
+        return 0  # Fallback if date is missing or invalid
+
+# ==========================================
+# 2. DEFINE THE GRAPH STATE
 # ==========================================
 class VarianceState(TypedDict):
     row_data: dict         
@@ -27,24 +44,22 @@ class VarianceState(TypedDict):
     final_reason: str      
 
 # ==========================================
-# 2. DEFINE THE GRAPH NODES
+# 3. DEFINE THE GRAPH NODES
 # ==========================================
 def retrieve_history_node(state: VarianceState) -> dict:
-    """Queries SQLite and extracts both the trend history AND the most recent exact comment."""
+    """Queries SQLite and filters chronologically for PREVIOUS months only."""
     db_path = "master_historical_db.db"
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
-    # FIXED: Updated to "Department_desc" exactly as requested
+    # Excluded Scenario and Dates so we can look back into previous timelines.
     standard_columns = [
-        "Scenario-A",
-        "Scenario-B",
         "Region", 
         "Market", 
         "OH_LC", 
         "Division_Desc", 
         "Function_desc",      
-        "Department_desc",    # <-- Fixed spelling here 
+        "Department_desc",    # Exact spelling matched 
         "Entity_desc",        
         "CostCat description"
     ]
@@ -55,7 +70,6 @@ def retrieve_history_node(state: VarianceState) -> dict:
     for col in standard_columns:
         if col in state["row_data"]:
             match_keys.append(col)
-            # .strip() removes hidden trailing spaces that break SQL matches
             val = str(state["row_data"][col]).strip() 
             values.append(val)
             
@@ -63,56 +77,59 @@ def retrieve_history_node(state: VarianceState) -> dict:
         cursor.execute("SELECT count(name) FROM sqlite_master WHERE type='table' AND name='historical_variances'")
         if cursor.fetchone()[0] == 0:
             conn.close()
-            return {
-                "history": "Master database initialized, but no historical data exists yet.",
-                "recent_historical_comment": "N/A",
-                "recent_historical_reason": "N/A"
-            }
+            return {"history": "Master database initialized, but no historical data exists yet.", "recent_historical_comment": "N/A", "recent_historical_reason": "N/A"}
 
         if not match_keys:
-             return {
-                 "history": "No standard structural dimensions found in this row.",
-                 "recent_historical_comment": "N/A",
-                 "recent_historical_reason": "N/A"
-             }
+             return {"history": "No standard structural dimensions found in this row.", "recent_historical_comment": "N/A", "recent_historical_reason": "N/A"}
 
         where_clauses = " AND ".join([f'"{col}" = ?' for col in match_keys])
         
+        # We pull everything matching the structure, chronological filtering happens in Python
         query = f"""
             SELECT Year, Month, "Variancce Amount ", Comments, Reason_for_variance 
             FROM historical_variances 
             WHERE {where_clauses} 
-            ORDER BY Year DESC, Month DESC LIMIT 6
         """
-
-        # --- SQL DEBUGGER (Will print to terminal so you can see exact matches) ---
-        print("\n" + "="*40)
-        print("🔍 SQL DEBUGGER:")
-        print(f"QUERY: \n{query.strip()}")
-        print(f"\nVALUES SEARCHED: \n{tuple(values)}")
-        print("="*40 + "\n")
-        # --------------------------------------------------------------------------
 
         cursor.execute(query, tuple(values))
         results = cursor.fetchall()
         conn.close()
         
-        if not results:
+        # --- CHRONOLOGICAL FILTERING: strictly look for PREVIOUS months ---
+        curr_date_num = get_yyyymm(state["row_data"].get("Year"), state["row_data"].get("Month"))
+        valid_history = []
+        
+        for row in results:
+            h_year, h_month, h_var, h_com, h_rea = row
+            h_date_num = get_yyyymm(h_year, h_month)
+            
+            # ONLY keep records that are chronologically BEFORE the current input month
+            if h_date_num > 0 and h_date_num < curr_date_num:
+                valid_history.append({
+                    'date_num': h_date_num, 'year': h_year, 'month': h_month, 
+                    'var': h_var, 'com': h_com, 'rea': h_rea
+                })
+        
+        if not valid_history:
             return {
-                "history": "No historical data found for this exact scenario and line item.",
+                "history": "No valid historical trend found strictly prior to this month.",
                 "recent_historical_comment": "No History Found",
                 "recent_historical_reason": "No History Found"
             }
             
-        # Extract the most recent historical comment and reason (Row 0 is the newest due to ORDER BY DESC)
-        most_recent_comment = results[0][3]
-        most_recent_reason = results[0][4]
+        # Sort chronologically (Newest to Oldest) and take the top 6 for the trend
+        valid_history.sort(key=lambda x: x['date_num'], reverse=True)
+        valid_history = valid_history[:6]
+        
+        # Extract the single most recent comment/reason for the Excel Output
+        most_recent_comment = valid_history[0]['com']
+        most_recent_reason = valid_history[0]['rea']
             
-        # Format the history so the AI can easily read the trend
+        # Format the history string for the AI Agent
         history_lines = ["--- HISTORICAL TREND ---"]
-        for row in results:
+        for item in valid_history:
             history_lines.append(
-                f"- {row[1]} {row[0]}: Variance = {row[2]} | Comment: '{row[3]}' | Reason: '{row[4]}'"
+                f"- {item['month']} {item['year']}: Variance = {item['var']} | Comment: '{item['com']}' | Reason: '{item['rea']}'"
             )
         
         return {
@@ -123,11 +140,7 @@ def retrieve_history_node(state: VarianceState) -> dict:
         
     except sqlite3.OperationalError as e:
         conn.close()
-        return {
-            "history": f"Database lookup failed: {e}",
-            "recent_historical_comment": "Error",
-            "recent_historical_reason": "Error"
-        }
+        return {"history": f"Database lookup failed: {e}", "recent_historical_comment": "Error", "recent_historical_reason": "Error"}
 
 def generate_draft_node(state: VarianceState) -> dict:
     """Passes the data to Azure OpenAI to analyze the trend and generate drafts."""
@@ -160,7 +173,6 @@ def generate_draft_node(state: VarianceState) -> dict:
     
     chain = prompt | llm
     
-    # FIXED: Updated to look for "Department_desc"
     details = {
         "Region": state["row_data"].get("Region", "Not Provided"),
         "Department": state["row_data"].get("Department_desc", "Not Provided"),
@@ -182,10 +194,7 @@ def generate_draft_node(state: VarianceState) -> dict:
             "draft_reason": ai_output.get("Reason_for_variance", "N/A")
         }
     except json.JSONDecodeError:
-        return {
-            "draft_comment": "Error parsing JSON.",
-            "draft_reason": "Raw Response: " + response.content 
-        }
+        return {"draft_comment": "Error parsing JSON.", "draft_reason": "Raw Response: " + response.content}
 
 def human_approval_node(state: VarianceState) -> dict:
     """Dummy node to interrupt the graph for human input."""
@@ -205,11 +214,10 @@ def save_memory_node(state: VarianceState) -> dict:
     insert_data["Comments"] = state["final_comment"]
     insert_data["Reason_for_variance"] = state["final_reason"]
     
-    # Prevent Excel-only columns from polluting the SQL database
-    insert_data.pop("New_AI_Comments", None)
-    insert_data.pop("New_AI_Reason", None)
-    insert_data.pop("Historical_Comment", None)
-    insert_data.pop("Historical_Reason", None)
+    # Clean output-only Excel columns so they don't break the SQL database schema
+    keys_to_remove = ["New_AI_Comments", "New_AI_Reason", "Historical_Comment", "Historical_Reason"]
+    for k in keys_to_remove:
+        insert_data.pop(k, None)
     
     columns_str = ", ".join([f'"{col}"' for col in insert_data.keys()])
     placeholders = ", ".join(["?"] * len(insert_data))
@@ -232,7 +240,7 @@ def save_memory_node(state: VarianceState) -> dict:
     return {}
 
 # ==========================================
-# 3. COMPILE THE LANGGRAPH WORKFLOW
+# 4. COMPILE THE LANGGRAPH WORKFLOW
 # ==========================================
 workflow = StateGraph(VarianceState)
 
@@ -251,7 +259,7 @@ memory = MemorySaver()
 app = workflow.compile(checkpointer=memory, interrupt_before=["human_approval"])
 
 # ==========================================
-# 4. EXECUTION LOOP
+# 5. EXECUTION LOOP
 # ==========================================
 def process_variances(input_excel, output_excel):
     print(f"Loading {input_excel}...\n")
@@ -261,15 +269,10 @@ def process_variances(input_excel, output_excel):
         print(f"Error: Could not find '{input_excel}'.")
         return
 
-    # CREATE NEW COLUMNS FOR THE EXCEL OUTPUT
-    if 'Historical_Comment' not in df.columns:
-        df['Historical_Comment'] = ""
-    if 'Historical_Reason' not in df.columns:
-        df['Historical_Reason'] = ""
-    if 'New_AI_Comments' not in df.columns:
-        df['New_AI_Comments'] = ""
-    if 'New_AI_Reason' not in df.columns:
-        df['New_AI_Reason'] = ""
+    # Create new columns for the Excel Output
+    for new_col in ['Historical_Comment', 'Historical_Reason', 'New_AI_Comments', 'New_AI_Reason']:
+        if new_col not in df.columns:
+            df[new_col] = ""
 
     print("="*60)
     print("STARTING AI REVIEW & HUMAN OVERSIGHT")
@@ -279,7 +282,6 @@ def process_variances(input_excel, output_excel):
         row_data = row.fillna("").to_dict()
         
         region = row_data.get('Region', 'Unknown Region')
-        # FIXED: Updated to look for "Department_desc"
         dept = row_data.get('Department_desc', 'Unknown Dept')
         cost_cat = row_data.get('CostCat description', 'Unknown Category')
         variance_amt = row_data.get('Variancce Amount ', 0) 
@@ -300,7 +302,6 @@ def process_variances(input_excel, output_excel):
         
         config = {"configurable": {"thread_id": f"batch_run_row_{index}"}}
 
-        # 1. Run until human approval
         for event in app.stream(initial_state, config):
             pass 
         
@@ -308,7 +309,6 @@ def process_variances(input_excel, output_excel):
         
         print(f"\n{current_state.get('history', 'None').strip()}")
         
-        # 2. Human Review Process
         print("\n--- AI DRAFTS ---")
         print(f"Comment : {current_state.get('draft_comment')}")
         print(f"Reason  : {current_state.get('draft_reason')}")
@@ -321,18 +321,16 @@ def process_variances(input_excel, output_excel):
         user_reason = input("Edit Reason  > ")
         final_reason = current_state['draft_reason'] if user_reason.strip() == "" else user_reason.strip()
         
-        # 3. Update state, resume graph, and save to DB
         app.update_state(config, {"final_comment": final_comment, "final_reason": final_reason})
         for event in app.stream(None, config):
             pass
             
-        # 4. WRITE EVERYTHING TO THE EXCEL DATAFRAME
+        # Write everything to the Excel dataframe
         df.at[index, 'Historical_Comment'] = current_state.get('recent_historical_comment', 'N/A')
         df.at[index, 'Historical_Reason'] = current_state.get('recent_historical_reason', 'N/A')
         df.at[index, 'New_AI_Comments'] = final_comment
         df.at[index, 'New_AI_Reason'] = final_reason
 
-    # Final Export
     print("\n" + "="*60)
     print(f"Review complete. Exporting final data to {output_excel}...")
     try:
@@ -342,7 +340,7 @@ def process_variances(input_excel, output_excel):
         print(f"Error exporting file: {e}. (Ensure the file isn't open).")
 
 # ==========================================
-# 5. EXECUTION
+# 6. RUN
 # ==========================================
 if __name__ == "__main__":
     my_input_file = "current_month_variances.xlsx"
