@@ -28,25 +28,35 @@ class VarianceState(TypedDict):
 # 2. DEFINE THE GRAPH NODES
 # ==========================================
 def retrieve_history_node(state: VarianceState) -> dict:
-    """Queries SQLite for previous months' variances based on exact dimensions."""
+    """Dynamically queries SQLite using whatever dimension columns exist in the data."""
     db_path = "master_historical_db.db"
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
-    # The exact columns that define a unique line item across months
-    match_keys = [
+    # The ideal list of dimensions we want to match on
+    ideal_keys = [
         "Region", "Market", "OH_LC", "Division_Desc", 
         "Function_Desc", "Department_Desc", "Entity_Desc", "CostCat description"
     ]
     
+    # DYNAMIC MATCH: Only use keys that actually exist in the current Excel row AND have a value
+    match_keys = [
+        key for key in ideal_keys 
+        if key in state["row_data"] and state["row_data"][key] != ""
+    ]
+    
     try:
-        # Check if table exists first
+        # Check if table exists
         cursor.execute("SELECT count(name) FROM sqlite_master WHERE type='table' AND name='historical_variances'")
         if cursor.fetchone()[0] == 0:
             conn.close()
             return {"history": "Master database initialized, but no historical data exists yet."}
 
-        # Safely wrap column names in double quotes to handle spaces (e.g., "CostCat description")
+        # Build query dynamically based ONLY on the available columns
+        if not match_keys:
+             return {"history": "No valid structural dimensions found in this row to query history."}
+
+        # Safely wrap column names in double quotes to handle spaces
         where_clauses = " AND ".join([f'"{col}" = ?' for col in match_keys])
         values = tuple(state["row_data"][col] for col in match_keys)
         
@@ -62,7 +72,7 @@ def retrieve_history_node(state: VarianceState) -> dict:
         conn.close()
         
         if not results:
-            return {"history": "No specific historical data found for this exact structural combination."}
+            return {"history": "No historical data found for this specific combination."}
             
         history_lines = [
             f"- {row[0]}-{row[1]} | Variance: {row[2]:,.2f} | Comment: {row[3]} | Reason: {row[4]}"
@@ -105,12 +115,22 @@ def generate_draft_node(state: VarianceState) -> dict:
     
     chain = prompt | llm
     
-    details = {k: state["row_data"][k] for k in ["Region", "Division_Desc", "Department_Desc", "CostCat description"]}
+    # Use .get() to prevent KeyErrors. If the column doesn't exist, it defaults to "Not Provided"
+    details = {
+        "Region": state["row_data"].get("Region", "Not Provided"),
+        "Division": state["row_data"].get("Division_Desc", state["row_data"].get("Division", "Not Provided")),
+        "Department": state["row_data"].get("Department_Desc", state["row_data"].get("Department", "Not Provided")),
+        "Cost Category": state["row_data"].get("CostCat description", state["row_data"].get("CostCat", "Not Provided"))
+    }
+    
+    # Dump the remaining non-empty string columns to give the LLM maximum context
+    extra_context = {k: v for k, v in state["row_data"].items() if isinstance(v, str) and v != "" and k not in details}
+    details["Additional_Context"] = extra_context
     
     response = chain.invoke({
-        "year": state["row_data"]["Year"],
-        "month": state["row_data"]["Month"],
-        "current_variance": state["row_data"]["variance Amount"],
+        "year": state["row_data"].get("Year", "Unknown"),
+        "month": state["row_data"].get("Month", "Unknown"),
+        "current_variance": state["row_data"].get("variance Amount", 0),
         "details": json.dumps(details),
         "history": state["history"]
     })
@@ -145,13 +165,13 @@ def save_memory_node(state: VarianceState) -> dict:
     insert_data["Comments"] = state["final_comment"]
     insert_data["Reason_for_variance"] = state["final_reason"]
     
-    # Wrap column names in double quotes to handle spaces/hyphens
+    # Wrap column names in double quotes to handle spaces/hyphens dynamically
     columns_str = ", ".join([f'"{col}"' for col in insert_data.keys()])
     placeholders = ", ".join(["?"] * len(insert_data))
     values = tuple(insert_data.values())
     
     try:
-        # Create table with all 18 columns explicitly
+        # Create table dynamically based on the current row's structure
         schema_defs = ", ".join([f'"{col}" TEXT' for col in insert_data.keys()])
         create_table_sql = f"CREATE TABLE IF NOT EXISTS historical_variances ({schema_defs})"
         cursor.execute(create_table_sql)
@@ -211,8 +231,14 @@ def process_variances(input_excel, output_excel):
         # Convert row to dict, replacing NaNs with empty strings for JSON/SQL compatibility
         row_data = row.fillna("").to_dict()
         
-        print(f"\n[{index + 1}/{len(df)}] Analyzing: {row_data['Region']} | {row_data['Department_Desc']} | {row_data['CostCat description']}")
-        print(f"Variance Amount: {row_data.get('variance Amount', 0):,.2f}")
+        # Safely get descriptive names for the console printout
+        region = row_data.get('Region', 'Unknown Region')
+        dept = row_data.get('Department_Desc', row_data.get('Department', 'Unknown Dept'))
+        cost_cat = row_data.get('CostCat description', row_data.get('CostCat', 'Unknown Category'))
+        variance_amt = row_data.get('variance Amount', 0)
+        
+        print(f"\n[{index + 1}/{len(df)}] Analyzing: {region} | {dept} | {cost_cat}")
+        print(f"Variance Amount: {variance_amt:,.2f}")
         
         initial_state = {
             "row_data": row_data,
